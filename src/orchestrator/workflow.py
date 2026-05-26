@@ -1,5 +1,6 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import time
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -11,18 +12,36 @@ class StepStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    RETRYING = "retrying"
+
+
+class WorkflowValidationError(ValueError):
+    """Raised when a workflow definition violates execution invariants."""
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        depends_on: Optional[List[str]] = None,
+        produces_artifacts: Optional[List[str]] = None,
+        cleanup_artifacts: Optional[List[str]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.depends_on = depends_on or []
+        self.produces_artifacts = produces_artifacts or []
+        self.cleanup_artifacts = cleanup_artifacts or []
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+        self.attempts = 0
 
 
 class Workflow:
@@ -46,6 +65,7 @@ class Workflow:
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self._audit_records: List[Dict[str, Any]] = []
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
@@ -61,26 +81,111 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
+    def register_workflow(self, workflow: Workflow) -> str:
+        self._validate_retry_artifact_cleanup(workflow)
+        self._workflows[workflow.id] = workflow
+        return workflow.id
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return [record.copy() for record in self._audit_records]
+
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
 
+        self._validate_retry_artifact_cleanup(workflow)
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
-            try:
-                result = step.handler()
-                step.result = result
-                step.status = StepStatus.COMPLETED
-            except Exception as e:
-                step.error = str(e)
-                step.status = StepStatus.FAILED
-                workflow.status = StepStatus.FAILED
-                return False
+            while True:
+                step.attempts += 1
+                try:
+                    result = step.handler()
+                    step.result = result
+                    step.status = StepStatus.COMPLETED
+                    break
+                except Exception as e:
+                    step.error = str(e)
+                    if step.attempts <= step.retries:
+                        step.status = StepStatus.RETRYING
+                        self._audit_records.append({
+                            "event": "workflow_step_retry",
+                            "workflow_id": workflow.id,
+                            "step_id": step.id,
+                            "attempt": step.attempts,
+                            "timestamp": time.time(),
+                        })
+                        continue
+                    step.status = StepStatus.FAILED
+                    workflow.status = StepStatus.FAILED
+                    return False
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _validate_retry_artifact_cleanup(self, workflow: Workflow) -> None:
+        artifact_owner: Dict[str, WorkflowStep] = {}
+        for step in workflow.steps:
+            for artifact in step.produces_artifacts:
+                artifact_owner[artifact] = step
+
+        completed_refs = set()
+        for step in workflow.steps:
+            blocked = [
+                artifact
+                for artifact in step.cleanup_artifacts
+                if self._cleanup_would_precede_retry_dependency(
+                    step,
+                    artifact_owner.get(artifact),
+                    completed_refs,
+                )
+            ]
+            if blocked:
+                self._record_cleanup_rejection(
+                    workflow,
+                    step,
+                    artifact_owner[blocked[0]],
+                    len(blocked),
+                )
+                raise WorkflowValidationError(
+                    "artifact cleanup cannot run before retry dependencies"
+                )
+            completed_refs.update({step.id, step.name})
+
+    def _cleanup_would_precede_retry_dependency(
+        self,
+        cleanup_step: WorkflowStep,
+        producer: Optional[WorkflowStep],
+        completed_refs: set,
+    ) -> bool:
+        if producer is None or producer.retries <= 0:
+            return False
+        producer_refs = {producer.id, producer.name}
+        depends_on_producer = bool(producer_refs.intersection(
+            cleanup_step.depends_on
+        ))
+        producer_precedes_cleanup = bool(producer_refs.intersection(
+            completed_refs
+        ))
+        return not depends_on_producer or not producer_precedes_cleanup
+
+    def _record_cleanup_rejection(
+        self,
+        workflow: Workflow,
+        cleanup_step: WorkflowStep,
+        producer: WorkflowStep,
+        artifact_count: int,
+    ) -> None:
+        self._audit_records.append({
+            "event": "artifact_cleanup_rejected",
+            "workflow_id": workflow.id,
+            "cleanup_step_id": cleanup_step.id,
+            "producer_step_id": producer.id,
+            "reason": "retry_dependency_not_satisfied",
+            "artifact_count": artifact_count,
+            "timestamp": time.time(),
+        })
 
 # 2019-03-27T19:58:07 update
 
