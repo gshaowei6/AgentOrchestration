@@ -1,10 +1,13 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 from uuid import uuid4
+
+
+class RetiredHandlerError(ValueError):
+    """Raised when a task targets a retired handler."""
 
 
 class PriorityQueue:
@@ -15,6 +18,15 @@ class PriorityQueue:
     def push(self, item: Any, priority: int = 0) -> None:
         heapq.heappush(self._queue, (-priority, self._counter, item))
         self._counter += 1
+
+    def remove_where(self, predicate: Callable[[Any], bool]) -> int:
+        original_size = len(self._queue)
+        self._queue = [
+            entry for entry in self._queue
+            if not predicate(entry[2])
+        ]
+        heapq.heapify(self._queue)
+        return original_size - len(self._queue)
 
     def pop(self) -> Optional[Any]:
         if self._queue:
@@ -33,40 +45,76 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._retired_handlers: Set[str] = set()
+        self._audit_records: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        self._ensure_handler_available(task, queue)
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task.setdefault("retries", 0)
+        task["priority"] = priority
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        self._ensure_handler_available(task, queue)
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["priority"] = priority
+        task["queue"] = queue
+        task["scheduled_for"] = time.time() + delay
+        self._scheduled[task_id] = task
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid
+            for tid, task in self._scheduled.items()
+            if task["scheduled_for"] <= now
+        ]
         for tid in expired:
             task = self._scheduled.pop(tid)
             if task:
-                self.enqueue(task, queue)
+                self.enqueue(
+                    task,
+                    queue=task.get("queue", queue),
+                    priority=task.get("priority", 0),
+                )
 
-        if queue in self._queues and len(self._queues[queue]) > 0:
+        while queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
-                return task
+            if not task:
+                continue
+            handler_id = self._handler_id(task)
+            if handler_id in self._retired_handlers:
+                self._record_rejection(handler_id, queue)
+                continue
+            self._in_flight[task["id"]] = task
+            return task
         return None
 
     def complete(self, task_id: str) -> bool:
@@ -80,6 +128,81 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def bind_registry(self, registry) -> None:
+        registry.add_change_listener(self.handle_registry_change)
+
+    def handle_registry_change(self, event: Dict[str, Any]) -> None:
+        if event.get("event") == "agent_deregistered":
+            self.retire_handler(
+                event["agent_id"],
+                reason="registry_deregistered",
+            )
+
+    def retire_handler(
+        self,
+        handler_id: str,
+        reason: str = "handler_retired",
+    ) -> Dict[str, Any]:
+        self._retired_handlers.add(handler_id)
+        removed_queued = 0
+        for queue in self._queues.values():
+            removed_queued += queue.remove_where(
+                lambda task: self._handler_id(task) == handler_id
+            )
+
+        removed_scheduled = 0
+        for task_id, task in list(self._scheduled.items()):
+            if self._handler_id(task) == handler_id:
+                self._scheduled.pop(task_id)
+                removed_scheduled += 1
+
+        removed_in_flight = 0
+        for task_id, task in list(self._in_flight.items()):
+            if self._handler_id(task) == handler_id:
+                self._in_flight.pop(task_id)
+                removed_in_flight += 1
+
+        record = {
+            "event": "handler_retired",
+            "handler_id": handler_id,
+            "reason": reason,
+            "removed_queued": removed_queued,
+            "removed_scheduled": removed_scheduled,
+            "removed_in_flight": removed_in_flight,
+            "timestamp": time.time(),
+        }
+        self._audit_records.append(record)
+        return record.copy()
+
+    def is_handler_retired(self, handler_id: str) -> bool:
+        return handler_id in self._retired_handlers
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return [record.copy() for record in self._audit_records]
+
+    def _ensure_handler_available(self, task: Dict, queue: str) -> None:
+        handler_id = self._handler_id(task)
+        if handler_id in self._retired_handlers:
+            self._record_rejection(handler_id, queue)
+            raise RetiredHandlerError("handler has been retired")
+
+    def _record_rejection(self, handler_id: str, queue: str) -> None:
+        self._audit_records.append({
+            "event": "task_rejected",
+            "handler_id": handler_id,
+            "queue": queue,
+            "reason": "handler_retired",
+            "timestamp": time.time(),
+        })
+
+    def _handler_id(self, task: Dict) -> Optional[str]:
+        return (
+            task.get("handler_id")
+            or task.get("target_agent")
+            or task.get("agent_id")
+            or task.get("handler")
+        )
 
 # 2019-04-25T08:37:12 update
 

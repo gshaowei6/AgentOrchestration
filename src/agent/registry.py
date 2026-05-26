@@ -1,10 +1,12 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+
+
+ChangeListener = Callable[[Dict[str, Any]], None]
 
 
 class AgentStatus(Enum):
@@ -21,8 +23,15 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._change_listeners: List[ChangeListener] = []
+        self._audit_records: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -45,7 +54,11 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -68,10 +81,36 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._emit_change("agent_deregistered", agent)
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def add_change_listener(self, listener: ChangeListener) -> None:
+        if listener not in self._change_listeners:
+            self._change_listeners.append(listener)
+
+    def remove_change_listener(self, listener: ChangeListener) -> None:
+        if listener in self._change_listeners:
+            self._change_listeners.remove(listener)
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return [record.copy() for record in self._audit_records]
+
+    def _emit_change(self, event_name: str, agent: Dict[str, Any]) -> None:
+        group = agent["type"].split(".")[0]
+        event = {
+            "event": event_name,
+            "agent_id": agent["id"],
+            "agent_type": agent["type"],
+            "group": group,
+            "status": agent["status"],
+            "timestamp": time.time(),
+        }
+        self._audit_records.append(event.copy())
+        for listener in list(self._change_listeners):
+            listener(event.copy())
 
 # 2019-01-29T11:24:49 update
 
